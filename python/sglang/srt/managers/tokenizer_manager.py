@@ -83,7 +83,6 @@ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
-    calibrate_time_diff,
     convert_time_to_realtime,
     real_time,
     set_time_batch,
@@ -483,6 +482,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+        time_stats = self._init_req_timestats(obj, request)
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
@@ -500,7 +500,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
-        time_stats = self._init_req_timestats(obj, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
@@ -2339,10 +2338,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         request: Optional[fastapi.Request] = None,
     ) -> "APIServerReqTimeStats":
         """Initialize time stats for a single request. Returns the time_stats object."""
-        calibrate_time_diff()
-        created_time = obj.received_time
-
         time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+        time_stats.set_created_time(obj.received_time)
 
         if self.server_args.enable_trace:
             if obj.external_trace_header:
@@ -2362,7 +2359,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 external_trace_header,
             )
 
-        time_stats.set_created_time(created_time)
         return time_stats
 
     def _should_dispatch_to_encoder(

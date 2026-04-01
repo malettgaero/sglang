@@ -25,43 +25,45 @@ For other or newer platforms, please refer to the dedicated pages for [AMD GPUs]
     uv pip install "sglang"
     ```
 
-    **Quick fixes to common problems**
+    ### Quick fixes to common problems
 
-    **Wrong torch version**
+    <AccordionGroup>
+      <Accordion title="Wrong torch version">
+        In some cases (for example, GB200), the command above might install a wrong torch version (for example, the CPU version) due to dependency resolution. Reinstall the correct [PyTorch](https://pytorch.org/get-started/locally/) with the following:
 
-    In some cases (for example, GB200), the command above might install a wrong torch version (for example, the CPU version) due to dependency resolution. Reinstall the correct [PyTorch](https://pytorch.org/get-started/locally/) with the following:
+        ```bash
+        uv pip install "torch" "torchvision" --extra-index-url https://download.pytorch.org/whl/cu129 --force-reinstall
+        ```
+      </Accordion>
 
-    ```bash
-    uv pip install "torch" "torchvision" --extra-index-url https://download.pytorch.org/whl/cu129 --force-reinstall
-    ```
+      <Accordion title="CUDA 13 without Docker">
+        If you do not have Docker access, install the matching `sgl_kernel` wheel from [the sgl-project whl releases](https://github.com/sgl-project/whl/releases) after installing SGLang. Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang (you can find this by running `uv pip show sgl_kernel`).
 
-    **CUDA 13 without Docker**
+        **x86_64**
 
-    If you do not have Docker access, install the matching `sgl_kernel` wheel from [the sgl-project whl releases](https://github.com/sgl-project/whl/releases) after installing SGLang. Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang (you can find this by running `uv pip show sgl_kernel`).
+        ```bash
+        uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
+        ```
 
-    **x86_64**
+        **aarch64**
 
-    ```bash
-    uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
-    ```
+        ```bash
+        uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
+        ```
+      </Accordion>
 
-    **aarch64**
+      <Accordion title="CUDA_HOME not set">
+        Choose one of the following solutions:
 
-    ```bash
-    uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
-    ```
+        1. Set `CUDA_HOME` to your CUDA install root:
 
-    **CUDA_HOME not set**
+        ```bash
+        export CUDA_HOME=/usr/local/cuda-<your-cuda-version>
+        ```
 
-    Choose one of the following solutions:
-
-    1. Set `CUDA_HOME` to your CUDA install root:
-
-    ```bash
-    export CUDA_HOME=/usr/local/cuda-<your-cuda-version>
-    ```
-
-    2. Install FlashInfer first following the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
+        2. Install FlashInfer first following the [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
+      </Accordion>
+    </AccordionGroup>
   </Tab>
 
   <Tab title="From source">
@@ -72,9 +74,13 @@ pip install --upgrade pip
 pip install -e "python"
 ```
 
-    **Quick fixes to common problems**
+    ### Quick fixes to common problems
 
-    - If you want to develop SGLang, try the dev docker image. Refer to [setup docker container](../developer_guide/development_guide_using_docker#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
+    <AccordionGroup>
+      <Accordion title="Development setup">
+        If you want to develop SGLang, try the dev docker image. Refer to [setup docker container](../developer_guide/development_guide_using_docker#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
+      </Accordion>
+    </AccordionGroup>
   </Tab>
 
   <Tab title="Docker">

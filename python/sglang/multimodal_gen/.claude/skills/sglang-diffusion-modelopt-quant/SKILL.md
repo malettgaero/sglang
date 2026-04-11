@@ -24,7 +24,7 @@ This skill owns the ModelOpt-to-SGLang bridge. It is not a generic kernel-tuning
 - For diffusion FP8, pin `dit_cpu_offload=false` and `dit_layerwise_offload=false`.
 - For multi-transformer pipelines, use per-component overrides when different components need different checkpoints.
 - When a branch is missing the validated helper tools, refresh `python/sglang/multimodal_gen/tools/convert_modelopt_fp8_checkpoint.py`, `python/sglang/multimodal_gen/tools/convert_hf_to_fp8.py`, `python/sglang/multimodal_gen/tools/build_modelopt_nvfp4_mixed_transformer.py`, and `python/sglang/multimodal_gen/tools/compare_diffusion_trajectory_similarity.py` instead of inventing one-off scripts elsewhere.
-- After validating a new ModelOpt quant path, update both the FP8 and NVFP4 support tables in this skill before closing the task.
+- After validating a new ModelOpt quant path, update the ModelOpt support matrix in `docs/diffusion/quantization.md` before closing the task.
 
 ## Read First
 
@@ -61,25 +61,9 @@ This repo now contains:
 
 ## Documentation Maintenance
 
-- Keep two separate support tables in this skill: one for FP8 and one for NVFP4.
-- After finishing a new quant support path, update both tables in every mirrored copy of this skill.
-- Each row must record the validated scope, the Hugging Face repo or path for the quantized DiT weights, and the key caveats.
+- Keep the validated ModelOpt support matrix in `docs/diffusion/quantization.md`.
+- Each row should record the validated scope, the Hugging Face repo or path for the quantized DiT weights, and the key caveats.
 - If the quantized DiT weights are not published yet, write `unpublished` explicitly instead of leaving the field blank.
-
-## FP8 Supported Models
-
-| Base Model | Validated Scope | HF DiT Weights | Notes |
-| --- | --- | --- | --- |
-| `black-forest-labs/FLUX.1-dev` | single-transformer override, deterministic latent/image comparison, H100 benchmark, torch-profiler trace | `BBuf/flux1-dev-modelopt-fp8-sglang-transformer` | SGLang converter keeps a validated BF16 fallback set for modulation and FF projection layers; use `--model-id FLUX.1-dev` for local mirrors |
-| `black-forest-labs/FLUX.2-dev` | single-transformer override load and generation path | `BBuf/flux2-dev-modelopt-fp8-sglang-transformer` | published SGLang-ready transformer override |
-| `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | primary `transformer` quantized, `transformer_2` kept BF16 | `BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer` | do not describe this as dual-transformer full-model FP8 unless that path is validated separately |
-
-## NVFP4 Supported Models
-
-| Base Model | Validated Scope | HF DiT Weights | Notes |
-| --- | --- | --- | --- |
-| `black-forest-labs/FLUX.1-dev` | mixed BF16+NVFP4 transformer override, correctness validation, 4x RTX 5090 benchmark, torch-profiler trace | `unpublished` | use `build_modelopt_nvfp4_mixed_transformer.py`; validated builder keeps selected FLUX.1 modules in BF16 and sets `swap_weight_nibbles=false` |
-| `black-forest-labs/FLUX.2-dev` | packed-QKV load path | `black-forest-labs/FLUX.2-dev-NVFP4` | validated packed export detection and runtime layout handling |
 
 ## FP8 Vs NVFP4
 

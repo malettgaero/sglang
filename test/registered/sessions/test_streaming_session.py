@@ -671,24 +671,25 @@ class TestStreamingSessionAbortLeakRepro(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--enable-streaming-session",
-                "--chunked-prefill-size",
-                str(ABORT_REPRO_CHUNKED_PREFILL_SIZE),
-                "--context-length",
-                str(ABORT_REPRO_CONTEXT_LEN),
-                "--page-size",
-                str(ABORT_REPRO_PAGE_SIZE),
-                "--max-running-requests",
-                "32",
-                "--log-level",
-                "info",
-            ],
-        )
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--enable-streaming-session",
+                    "--chunked-prefill-size",
+                    str(ABORT_REPRO_CHUNKED_PREFILL_SIZE),
+                    "--context-length",
+                    str(ABORT_REPRO_CONTEXT_LEN),
+                    "--page-size",
+                    str(ABORT_REPRO_PAGE_SIZE),
+                    "--max-running-requests",
+                    "32",
+                    "--log-level",
+                    "info",
+                ],
+            )
         cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod

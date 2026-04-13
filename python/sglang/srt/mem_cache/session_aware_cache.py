@@ -199,15 +199,7 @@ class SessionAwareCache(BasePrefixCache):
         # restore, the request gets a fresh pool slot from alloc_for_extend
         # and the session slot remains untouched.
         if req.to_finish is not None:
-            result = self.inner.match_prefix(params)
-            logger.warning(
-                f"[DBG abort_match] rid={req.rid[:8]} sid={req.session.session_id[:8]} "
-                f"token_ids_len={len(params.key.token_ids)} "
-                f"matched={len(result.device_indices)} "
-                f"match_protected={result.cache_protected_len} "
-                f"to_finish={req.to_finish}"
-            )
-            return result
+            return self.inner.match_prefix(params)
 
         slot.restore_to_req(req)
 
@@ -271,13 +263,6 @@ class SessionAwareCache(BasePrefixCache):
         # request got a fresh pool slot from alloc_for_extend.  Don't
         # overwrite the session slot -- free the transient KV and pool slot.
         if not is_first and isinstance(req.finished_reason, FINISH_ABORT):
-            logger.warning(
-                f"[DBG abort_finish] rid={req.rid[:8]} sid={session_id[:8]} "
-                f"alloc={req.kv_allocated_len} committed={req.kv_committed_len} "
-                f"protected={req.cache_protected_len} pool_idx={req.req_pool_idx} "
-                f"slot_alloc={slot.kv_allocated_len} slot_committed={slot.kv_committed_len} "
-                f"slot_protected={slot.cache_protected_len}"
-            )
             if req.req_pool_idx is not None:
                 # Free all KV pages allocated for this aborted request.
                 end = req.kv_allocated_len
@@ -466,15 +451,9 @@ class SessionAwareCache(BasePrefixCache):
         A slot's pool_idx being in active_pool_idxs indicates a req owns it.
         """
         total = 0
-        for sid, slot in self.slots.items():
+        for slot in self.slots.values():
             in_batch = (
                 active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
-            )
-            logger.warning(
-                f"[DBG slot_held] sid={sid[:8]} is_holding_kv={slot.is_holding_kv} "
-                f"in_batch={in_batch} alloc={slot.kv_allocated_len} "
-                f"committed={slot.kv_committed_len} protected={slot.cache_protected_len} "
-                f"pool_idx={slot.req_pool_idx} active={active_pool_idxs}"
             )
             if slot.is_holding_kv and not in_batch:
                 allocated = ceil_align(slot.kv_allocated_len, self.page_size)

@@ -225,7 +225,12 @@ class SessionAwareCache(BasePrefixCache):
             slot.swa_evicted_seqlen = min(slot.swa_evicted_seqlen, free_start)
             req.kv_allocated_len = free_start
             req.kv_committed_len = min(req.kv_committed_len, free_start)
-            req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, free_start)
+            # Clamp to prefix_len (not free_start): downstream prepare_for_extend
+            # resets req.kv_allocated_len to prefix_len; if swa_evicted stayed at
+            # free_start > prefix_len (case: slot.cache_protected_len > prefix_len),
+            # decode grows allocated to prefix_len+N < free_start, so swa_evicted
+            # would outrun allocated and break the busy-check invariant.
+            req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, prefix_len)
 
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len

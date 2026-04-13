@@ -23,7 +23,9 @@ from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
+    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -429,6 +431,11 @@ class TestStreamingSession(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    # Spec decoding's last sampled token (from target's free logit) has no KV
+    # built before max_new_tokens triggers stop, so the slot stores N-1 KV for
+    # N output tokens. Subclasses override to -1 to relax the inheritance check.
+    kv_inherit_offset = 0
+
     def test_kv_cache_inheritance(self, gen_len=12):
         """Verify KV inheritance, radix cache insertion, and flush reclamation."""
         chunks = [
@@ -477,10 +484,11 @@ class TestStreamingSession(CustomTestCase):
             else:
                 # Turns 2+ inherit KV from the previous turn (via inherit_kv_states,
                 # not radix tree matching). cached_tokens reflects the inherited prefix.
+                expected = prev_kv_len + self.kv_inherit_offset
                 self.assertEqual(
                     cached,
-                    prev_kv_len,
-                    f"Turn {turn_idx + 1}: should inherit {prev_kv_len} KV tokens from previous turn",
+                    expected,
+                    f"Turn {turn_idx + 1}: should inherit {expected} KV tokens from previous turn",
                 )
             prev_kv_len = prompt_tokens + completion_tokens
 
@@ -657,6 +665,54 @@ class TestStreamingSessionRetractMixedChunk(TestStreamingSession):
                     "--chunked-prefill-size",
                     "128",
                     "--enable-mixed-chunk",
+                ],
+            )
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+
+class TestStreamingSessionEagle(TestStreamingSession):
+    """Streaming session with EAGLE3 speculative decoding.
+
+    Streaming session is incompatible with overlap + speculative, so
+    --disable-overlap-schedule is required.
+    """
+
+    # Spec decoding's last token has no KV at finish (see base class note).
+    kv_inherit_offset = -1
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_TARGET_MODEL_EAGLE3
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(
+            2
+        ), envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--enable-streaming-session",
+                    "--disable-overlap-schedule",
+                    "--chunked-prefill-size",
+                    "512",
+                    "--dtype=float16",
+                    "--speculative-algorithm",
+                    "EAGLE3",
+                    "--speculative-draft-model",
+                    DEFAULT_DRAFT_MODEL_EAGLE3,
+                    "--speculative-num-steps",
+                    "3",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "4",
+                    "--mem-fraction-static",
+                    "0.7",
                 ],
             )
         cls.tokenizer = get_tokenizer(cls.model)

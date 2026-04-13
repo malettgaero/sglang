@@ -219,8 +219,13 @@ class SessionAwareCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(tail_indices)
             slot.kv_allocated_len = free_start
             slot.kv_committed_len = min(slot.kv_committed_len, free_start)
+            # SWA-only: keep swa_evicted_seqlen <= kv_allocated_len so the busy
+            # mem check's uncached = allocated - max(protected, evicted) stays
+            # non-negative when the slot shrinks below the past SWA watermark.
+            slot.swa_evicted_seqlen = min(slot.swa_evicted_seqlen, free_start)
             req.kv_allocated_len = free_start
             req.kv_committed_len = min(req.kv_committed_len, free_start)
+            req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, free_start)
 
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len

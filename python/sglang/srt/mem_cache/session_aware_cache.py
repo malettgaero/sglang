@@ -313,8 +313,12 @@ class SessionAwareCache(BasePrefixCache):
                     slot.req_pool_idx, new_end:old_end
                 ]
                 self.token_to_kv_pool_allocator.free(kv_indices)
+            # req.cache_protected_len represents the actual tree-shared prefix
+            # length (from match_prefix). req.kv_committed_len may include
+            # positions that were overwritten by alloc_for_extend with new
+            # indices not in the tree.
             slot.cache_protected_len = min(
-                slot.cache_protected_len, req.kv_committed_len
+                slot.cache_protected_len, req.cache_protected_len
             )
 
         slot.save_from_req(req, is_first=is_first)

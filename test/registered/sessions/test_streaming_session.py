@@ -431,9 +431,12 @@ class TestStreamingSession(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    # Spec decoding's last sampled token (from target's free logit) has no KV
-    # built before max_new_tokens triggers stop, so the slot stores N-1 KV for
-    # N output tokens. Subclasses override to -1 to relax the inheritance check.
+    # Overlap scheduler defers the last decode iteration's commit by one step,
+    # so its "in-flight" last token gets committed by the time the request
+    # finishes. With overlap disabled (e.g. streaming session + speculative
+    # decoding), the last sampled token isn't committed before max_new_tokens
+    # stops, leaving slot.kv_committed_len = input + output - 1. Subclasses
+    # that disable overlap should set this to -1 to relax the inheritance check.
     kv_inherit_offset = 0
 
     def test_kv_cache_inheritance(self, gen_len=12):
@@ -681,7 +684,8 @@ class TestStreamingSessionEagle(TestStreamingSession):
     --disable-overlap-schedule is required.
     """
 
-    # Spec decoding's last token has no KV at finish (see base class note).
+    # Overlap is disabled (required for spec + streaming session), so the
+    # last token isn't committed before stop. See base class note.
     kv_inherit_offset = -1
 
     @classmethod

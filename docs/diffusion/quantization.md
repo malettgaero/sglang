@@ -154,6 +154,10 @@ sglang generate \
 - On Blackwell, the validated Wan2.2 ModelOpt NVFP4 path currently prefers
   FlashInfer FP4 GEMM via
   `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn`.
+- This environment-variable override is a current workaround for NVFP4 cases
+  where the default sglang JIT/CUTLASS `sm100` path rejects a large-M shape at
+  `can_implement()`. The intended long-term fix is to add a validated CUTLASS
+  fallback for those shapes rather than rely on the override.
 - Direct `--model-path` loading is a compatibility path for FLUX.2 NVFP4-style
   repos or local directories.
 - If `--transformer-weights-path` is provided explicitly, it takes precedence

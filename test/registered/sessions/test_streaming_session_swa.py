@@ -158,12 +158,6 @@ class TestStreamingSessionSWARetractMixedChunk(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-@unittest.skip(
-    "SWA abort-heavy repro exposes a residual 1-page (16-token) SWA leak "
-    "after the abort-bound prefill path; the busy check detects it but the "
-    "root cause is not yet isolated. Separate issue from the 4 baseline "
-    "SWA leak tests which do pass under strict busy check."
-)
 class TestStreamingSessionSWAAbortLeakRepro(TestStreamingSessionAbortLeakRepro):
     """SWA abort-heavy chunked prefill leak repro."""
 

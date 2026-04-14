@@ -455,8 +455,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize MooncakeTransferEngine
         self.init_shared_mooncake_transfer_engine()
 
-        # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        # Init forward/schedule streams for overlap schedule.
+        # On supported GPUs, use Green Context to partition SMs so that the
+        # schedule stream always has dedicated SMs even when the forward
+        # stream runs CLC-persistent GEMM kernels that occupy all other SMs.
+        self.forward_stream, self.schedule_stream = self._create_overlap_streams()
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
@@ -975,6 +978,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
                     f"You can fix this by setting arguments `--tp` and `--ep` correctly."
                 )
+
+    _GREENCTX_SCHEDULE_SMS = 8  # minimum partition size for CC >= 9.0
+
+    def _create_overlap_streams(self):
+        """Create forward and schedule streams, optionally with Green Context SM partitioning."""
+        device_mod = torch.get_device_module(self.device)
+        if not self.server_args.disable_overlap_schedule and self.device == "cuda":
+            try:
+                from sgl_kernel import spatial
+
+                total_sm = spatial.get_sm_available(self.gpu_id)
+                schedule_sm = self._GREENCTX_SCHEDULE_SMS
+                forward_sm = total_sm - schedule_sm
+                fwd, sched = spatial.create_greenctx_stream_by_value(
+                    forward_sm, schedule_sm, self.gpu_id
+                )
+                logger.info(
+                    "Green Context overlap streams: forward=%d SMs, schedule=%d SMs",
+                    forward_sm,
+                    schedule_sm,
+                )
+                return fwd, sched
+            except Exception as e:
+                logger.debug("Green Context unavailable, using plain streams: %s", e)
+        return device_mod.Stream(), None
 
     def init_torch_distributed(self):
         tic = time.perf_counter()

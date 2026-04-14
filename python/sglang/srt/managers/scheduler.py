@@ -682,6 +682,7 @@ class Scheduler(
             _,
             _,
             _,
+            self._greenctx_schedule_stream,
         ) = self.tp_worker.get_worker_info()
         if get_global_server_args().pp_max_micro_batch_size is None:
             get_global_server_args().pp_max_micro_batch_size = max(
@@ -1354,7 +1355,10 @@ class Scheduler(
         Sets up the schedule stream and dispatches to the appropriate event loop.
         The event loop blocks until shutdown.
         """
-        self.schedule_stream = self.device_module.Stream(priority=0)
+        if self._greenctx_schedule_stream is not None:
+            self.schedule_stream = self._greenctx_schedule_stream
+        else:
+            self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         with self.device_module.StreamContext(self.schedule_stream):

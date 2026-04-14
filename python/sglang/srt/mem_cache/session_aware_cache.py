@@ -234,13 +234,11 @@ class SessionAwareCache(BasePrefixCache):
         slot = self.slots.get(session_id)
         is_first = slot is None
 
-        # When an aborted streaming-session request was scheduled (e.g.
-        # input too long), match_prefix skipped restore_to_req so the
-        # request got a fresh pool slot from alloc_for_extend.  Don't
-        # overwrite the session slot -- free the transient KV and pool slot.
-        if not is_first and isinstance(req.finished_reason, FINISH_ABORT):
+        # Aborted request: free the transient pool slot and don't touch
+        # the session slot. For first request abort, don't create a slot
+        # at all — the session stays empty for the next attempt.
+        if isinstance(req.finished_reason, FINISH_ABORT):
             if req.req_pool_idx is not None:
-                # Free all KV pages allocated for this aborted request.
                 end = req.kv_allocated_len
                 if end > 0:
                     kv_indices = self.req_to_token_pool.req_to_token[

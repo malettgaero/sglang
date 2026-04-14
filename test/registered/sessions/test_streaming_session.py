@@ -745,13 +745,13 @@ class TestStreamingSession(CustomTestCase):
                 time.sleep(0.5)
             self.assertEqual(resp_3.status_code, 200, resp_3.text)
             data_3 = resp_3.json()
-            # cached_tokens must equal turn 1's total tokens (prompt + completion).
-            # If the aborted turn 2's inflated kv_committed_len leaked into the
-            # slot, cached_tokens would be larger.
+            # cached_tokens must equal turn 1's KV (prompt + completion + offset).
+            # Eagle spec has kv_inherit_offset=-1 (free token has no KV).
+            expected_cached = turn_1_total + self.kv_inherit_offset
             self.assertEqual(
                 data_3["meta_info"]["cached_tokens"],
-                turn_1_total,
-                f"Recovery should inherit exactly turn 1's KV ({turn_1_total}), "
+                expected_cached,
+                f"Recovery should inherit exactly turn 1's KV ({expected_cached}), "
                 f"not inflated by aborted turn 2",
             )
         finally:

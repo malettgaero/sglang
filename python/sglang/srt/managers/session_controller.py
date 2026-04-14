@@ -362,7 +362,7 @@ class SessionController:
                 self._close(sid)
 
     @staticmethod
-    def _all_requests_finished(session: "Session") -> bool:
+    def _all_requests_finished(session: Session) -> bool:
         if not session.req_nodes:
             return True
         return all(node.req.finished() for node in session.req_nodes.values())

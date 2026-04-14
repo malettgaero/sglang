@@ -202,14 +202,13 @@ class SessionAwareCache(BasePrefixCache):
         prefix_len = min(req.kv_committed_len, len(params.key.token_ids))
 
         # alloc_for_extend will write new KV indices into req_to_token[prefix_len:seq_len],
-        # orphaning slot's tail indices in [prefix_len, slot.kv_allocated_len).
-        # Free that orphaned range, but never below cache_protected_len — those
-        # tokens are owned by the tree (locked), and freeing them would corrupt
-        # the tree's KV. The shrink path in cache_finished_req handles the case
-        # where the request is genuinely shorter than the protected prefix.
-        # Ceil-align free_start so partial pages are not freed (allocator is
-        # page-granular); prefix_len itself stays unaligned to preserve full
-        # token inheritance.
+        # orphaning slot's tail indices beyond prefix_len. Free only WHOLE
+        # orphaned pages -- the partial page straddling the prefix boundary is
+        # shared between inherited KV and the overwrite zone and must not be
+        # freed. Ceil-align free_start to skip that partial page. The slot/req
+        # lengths are set to prefix_len (not free_start) so accounting stays
+        # exact; ceil_align in session_held_tokens / busy check handles the
+        # physical page overhead.
         free_start = max(prefix_len, slot.cache_protected_len)
         if self.page_size > 1:
             free_start = ceil_align(free_start, self.page_size)
@@ -218,19 +217,14 @@ class SessionAwareCache(BasePrefixCache):
                 slot.req_pool_idx, free_start : slot.kv_allocated_len
             ]
             self.token_to_kv_pool_allocator.free(tail_indices)
-            slot.kv_allocated_len = free_start
-            slot.kv_committed_len = min(slot.kv_committed_len, free_start)
+            slot.kv_allocated_len = prefix_len
+            slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
             # SWA-only: keep swa_evicted_seqlen <= kv_allocated_len so the busy
             # mem check's uncached = allocated - max(protected, evicted) stays
             # non-negative when the slot shrinks below the past SWA watermark.
-            slot.swa_evicted_seqlen = min(slot.swa_evicted_seqlen, free_start)
-            req.kv_allocated_len = free_start
-            req.kv_committed_len = min(req.kv_committed_len, free_start)
-            # Clamp to prefix_len (not free_start): downstream prepare_for_extend
-            # resets req.kv_allocated_len to prefix_len; if swa_evicted stayed at
-            # free_start > prefix_len (case: slot.cache_protected_len > prefix_len),
-            # decode grows allocated to prefix_len+N < free_start, so swa_evicted
-            # would outrun allocated and break the busy-check invariant.
+            slot.swa_evicted_seqlen = min(slot.swa_evicted_seqlen, prefix_len)
+            req.kv_allocated_len = prefix_len
+            req.kv_committed_len = min(req.kv_committed_len, prefix_len)
             req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, prefix_len)
 
         device_indices = self.req_to_token_pool.req_to_token[

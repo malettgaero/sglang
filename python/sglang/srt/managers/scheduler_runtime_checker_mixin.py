@@ -406,6 +406,7 @@ class SchedulerRuntimeCheckerMixin:
             logger.info(f"[Mem Check (BUSY)] {full_msg}")
             if swa_msg:
                 logger.info(f"[Mem Check (BUSY)] {swa_msg}")
+
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
         assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
 

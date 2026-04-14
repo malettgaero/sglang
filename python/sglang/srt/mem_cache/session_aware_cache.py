@@ -250,28 +250,29 @@ class SessionAwareCache(BasePrefixCache):
                     self.token_to_kv_pool_allocator.free(kv_indices)
                     self.req_to_token_pool.free_slots.append(req.req_pool_idx)
                     req.req_pool_idx = None
-                self._mark_kv_freed(req)
-                return
             else:
-                # Mid-processing abort: req has the session slot's pool_idx.
-                # Don't save_from_req — prepare_for_extend may have inflated
-                # kv_committed_len before forward actually committed. Keep the
-                # slot's pre-abort state. _free_tail on the next turn handles
-                # any alloc-commit gap via slot.kv_allocated_len.
-                self._mark_kv_freed(req)
-                return
+                # Mid-processing abort: free tokens allocated during this
+                # turn (beyond slot's pre-abort state), keep slot's KV.
+                if req.kv_allocated_len > slot.kv_allocated_len:
+                    tail = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx,
+                        slot.kv_allocated_len : req.kv_allocated_len,
+                    ]
+                    self.token_to_kv_pool_allocator.free(tail)
+                req.req_pool_idx = None
+            req.session.abort_req()
+            self._mark_kv_freed(req)
+            return
 
         if is_first:
             slot = SessionSlot()
             self.slots[session_id] = slot
 
-        # No spec tail trim here — match_prefix's orphan tail free handles
-        # all cases (spec tail, alloc-commit gap, logit reserve) at the
-        # start of the next turn.
         slot.save_from_req(req, is_first=is_first)
 
-        # Mark bookkeeping flags so the busy check doesn't count this
-        # finished request as uncached KV.
+        # Update req_nodes to this successfully finished request.
+        req.session.finish_req(req)
+
         self._mark_kv_freed(req)
 
     def _free_tail(self, slot: SessionSlot, req: Req, prefix_len: int):

@@ -49,7 +49,13 @@ class _FakeReq:
     def __init__(
         self, session_id: str, req_pool_idx: int, committed: int, allocated: int
     ):
-        self.session = SimpleNamespace(session_id=session_id, streaming=True)
+        self.session = SimpleNamespace(
+            session_id=session_id,
+            streaming=True,
+            finish_req=lambda req: None,
+            abort_req=lambda: None,
+            _inflight=False,
+        )
         self.req_pool_idx = req_pool_idx
         self.kv_committed_len = committed
         self.kv_allocated_len = allocated
@@ -271,9 +277,12 @@ def test_mid_processing_abort_preserves_session_slot():
     assert slot.req_pool_idx == 0
     assert slot.kv_committed_len == 50  # unchanged from before abort
     assert slot.kv_allocated_len == 50  # unchanged
-    # No KV freed (session slot kept intact).
-    assert len(allocator.freed) == 0
+    # Tokens allocated during the aborted turn [50, 65) are freed.
+    # Slot's original KV [0, 50) is kept intact.
+    assert len(allocator.freed) == 1
+    assert allocator.freed[0].tolist() == list(range(50, 65))  # req_to_token[0, 50:65]
     assert req_to_token_pool.free_slots == []
+    assert req.req_pool_idx is None
     # Bookkeeping flags set.
     assert req.kv_committed_freed is True
     assert req.kv_overallocated_freed is True

@@ -675,7 +675,10 @@ class TestStreamingSession(CustomTestCase):
             )
             self.assertEqual(resp_1.status_code, 200, resp_1.text)
             data_1 = resp_1.json()
-            rid_1 = data_1["meta_info"]["id"]
+            turn_1_total = (
+                data_1["meta_info"]["prompt_tokens"]
+                + data_1["meta_info"]["completion_tokens"]
+            )
 
             # Turn 2: start a long generate, then abort mid-decode
             ids_2 = self.tokenizer.encode(" Continue the story in great detail.")
@@ -691,7 +694,7 @@ class TestStreamingSession(CustomTestCase):
                         "input_ids": ids_2,
                         "sampling_params": {
                             "temperature": 0,
-                            "max_new_tokens": 256,
+                            "max_new_tokens": 100000,
                         },
                         "session_params": {"id": session_id, "rid": None},
                     },
@@ -702,36 +705,54 @@ class TestStreamingSession(CustomTestCase):
             t = threading.Thread(target=do_generate)
             t.start()
 
-            # Wait a bit for decode to start, then abort
-            time.sleep(2)
+            # Wait for decode to start, then abort all running requests.
+            time.sleep(0.5)
             abort_resp = requests.post(
-                self.base_url + "/abort",
-                json={"rid": None, "abort_all": False},
+                self.base_url + "/abort_request",
+                json={"rid": "", "abort_all": True},
                 timeout=10,
             )
+            self.assertEqual(abort_resp.status_code, 200, abort_resp.text)
 
             t.join(timeout=30)
 
-            # Turn 3: recovery — session should still work
-            ids_3 = self.tokenizer.encode(" What happens next?")
-            resp_3 = requests.post(
-                self.base_url + "/generate",
-                json={
-                    "input_ids": ids_3,
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": 8,
-                    },
-                    "session_params": {"id": session_id, "rid": None},
-                },
-                timeout=30,
+            # Verify turn 2 was actually aborted mid-processing.
+            self.assertIsNotNone(result[0], "Turn 2 should have returned")
+            data_2 = result[0].json()
+            self.assertEqual(
+                data_2["meta_info"]["finish_reason"]["type"],
+                "abort",
+                "Turn 2 should be aborted, not finished normally",
             )
+
+            # Turn 3: retry until the inflight flag clears (abort processed).
+            ids_3 = self.tokenizer.encode(" What happens next?")
+            for attempt in range(20):
+                resp_3 = requests.post(
+                    self.base_url + "/generate",
+                    json={
+                        "input_ids": ids_3,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 8,
+                        },
+                        "session_params": {"id": session_id, "rid": None},
+                    },
+                    timeout=30,
+                )
+                if resp_3.status_code == 200:
+                    break
+                time.sleep(0.5)
             self.assertEqual(resp_3.status_code, 200, resp_3.text)
             data_3 = resp_3.json()
-            self.assertGreater(
+            # cached_tokens must equal turn 1's total tokens (prompt + completion).
+            # If the aborted turn 2's inflated kv_committed_len leaked into the
+            # slot, cached_tokens would be larger.
+            self.assertEqual(
                 data_3["meta_info"]["cached_tokens"],
-                0,
-                "Recovery after mid-processing abort should inherit KV",
+                turn_1_total,
+                f"Recovery should inherit exactly turn 1's KV ({turn_1_total}), "
+                f"not inflated by aborted turn 2",
             )
         finally:
             requests.post(

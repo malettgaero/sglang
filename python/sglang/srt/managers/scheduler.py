@@ -1975,10 +1975,6 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        # All validation passed. Commit streaming session req_nodes.
-        if req.session is not None and req.session.streaming:
-            req.session.commit_req(req)
-
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)

@@ -210,6 +210,73 @@ def test_aborted_streaming_turn_preserves_slot_and_accounting(monkeypatch):
     assert allocator.freed[1].tolist() == list(range(16, 48))
 
 
+def test_first_request_abort_does_not_create_slot():
+    """When the very first request on a session is aborted, no slot should
+    be created. The session stays empty for the next attempt."""
+    page_size = 1
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    tree_cache = SessionAwareCache(inner)
+
+    # No slot exists yet (first request).
+    req = _FakeReq("session-a", req_pool_idx=0, committed=0, allocated=20)
+    req.finished_reason = FINISH_ABORT("input too long")
+
+    tree_cache.cache_finished_req(req)
+
+    # Slot must NOT be created.
+    assert "session-a" not in tree_cache.slots
+    # Transient pool slot freed.
+    assert req.req_pool_idx is None
+    assert req_to_token_pool.free_slots == [0]
+    assert len(allocator.freed) == 1
+    assert allocator.freed[0].tolist() == list(range(20))
+    # Bookkeeping flags set.
+    assert req.kv_committed_freed is True
+    assert req.kv_overallocated_freed is True
+
+
+def test_mid_processing_abort_preserves_session_slot():
+    """When a running streaming session req is aborted mid-processing
+    (e.g. client disconnect), the session slot should be preserved with
+    the committed KV, not destroyed."""
+    page_size = 1
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
+    tree_cache = SessionAwareCache(inner)
+
+    # Session already has a slot from a previous turn.
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=50,
+        kv_allocated_len=50,
+        last_node="lock-node",
+        cache_protected_len=16,
+    )
+
+    # Mid-processing abort: req has the SESSION slot's pool_idx (restore_to_req ran).
+    req = _FakeReq("session-a", req_pool_idx=0, committed=60, allocated=65)
+    req.finished_reason = FINISH_ABORT("client disconnected")
+
+    tree_cache.cache_finished_req(req)
+
+    slot = tree_cache.slots["session-a"]
+    # Slot preserved with the req's committed state (save_from_req ran).
+    assert slot.req_pool_idx == 0
+    assert slot.kv_committed_len == 60
+    assert slot.kv_allocated_len == 65
+    # No KV freed (session slot is kept intact).
+    assert len(allocator.freed) == 0
+    assert req_to_token_pool.free_slots == []
+    # Bookkeeping flags set.
+    assert req.kv_committed_freed is True
+    assert req.kv_overallocated_freed is True
+
+
 # Shrink tests removed: streaming sessions are append-only after the
 # rollback fix in session_controller (rollback_aborted_req).  The shrink
 # code path in cache_finished_req no longer exists.

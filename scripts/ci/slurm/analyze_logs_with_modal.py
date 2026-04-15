@@ -180,7 +180,10 @@ Analyze the log bundle for job `{job_id}`.
 1. Read the logs in the priority order described above.
 2. Correlate timestamps to identify the most likely root cause.
 3. Use `gh` to inspect related PRs or commits if it materially helps.
-4. Write the final markdown report to `/workspace/logs/ai_analysis.md`.
+4. **You MUST write the final markdown report to `/workspace/logs/ai_analysis.md`.**
+   This is a hard requirement. Do not just print the report to stdout.
+   Use your file-writing tool to create `/workspace/logs/ai_analysis.md` with the
+   full analysis. The downstream pipeline reads this file.
 
 Keep the report concise but concrete. Include evidence, likely root cause, and notable noise.
 """

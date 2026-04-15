@@ -40,6 +40,24 @@ DEFAULT_REPOS = [
 PROMPT_PATH = Path(__file__).with_name("log_analysis_prompt.md")
 
 
+def configure_logging(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+
+def extract_tarball(tarball: Path, destination: Path) -> None:
+    with tarfile.open(tarball, "r:gz") as archive:
+        # Python 3.14 changes the default extraction behavior. Use the
+        # data filter when available so extraction remains explicit.
+        if "data" in tarfile._NAMED_FILTERS:  # type: ignore[attr-defined]
+            archive.extractall(destination, filter="data")
+        else:
+            archive.extractall(destination)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Analyze a srtslurm log bundle with opencode in Modal."
@@ -140,8 +158,7 @@ def prepare_log_dir(args: argparse.Namespace) -> tuple[Path, Path | None]:
         raise FileNotFoundError(f"tarball not found: {args.tarball}")
 
     temp_dir = Path(tempfile.mkdtemp(prefix="sglang_logs_"))
-    with tarfile.open(args.tarball, "r:gz") as archive:
-        archive.extractall(temp_dir)
+    extract_tarball(args.tarball, temp_dir)
     return temp_dir.resolve(), temp_dir
 
 
@@ -275,10 +292,7 @@ opencode run \\
 
 def main() -> int:
     args = parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s: %(message)s",
-    )
+    configure_logging(args.verbose)
 
     repo_urls = list(DEFAULT_REPOS)
     if args.repo_urls:

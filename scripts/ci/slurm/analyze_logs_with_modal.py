@@ -22,7 +22,6 @@ import shlex
 import shutil
 import tarfile
 import tempfile
-import warnings
 from pathlib import Path
 
 try:
@@ -43,19 +42,6 @@ PROMPT_PATH = Path(__file__).with_name("log_analysis_prompt.md")
 
 
 def configure_logging(verbose: bool) -> None:
-    warnings.filterwarnings(
-        "ignore",
-        category=PendingDeprecationWarning,
-        module=r"modal(\..*)?",
-    )
-    warnings.filterwarnings(
-        "ignore",
-        message=r".*Sandbox\.open\(\) is deprecated.*",
-    )
-    warnings.filterwarnings(
-        "ignore",
-        message=r".*FileIO\.(write|read)\(\) is deprecated.*",
-    )
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s: %(message)s",
@@ -205,10 +191,9 @@ def upload_tree(sandbox: "modal.Sandbox", log_dir: Path) -> None:
     logger.info("Uploading %d log files into the sandbox", len(log_files))
     for index, log_file in enumerate(log_files, start=1):
         rel_path = log_file.relative_to(log_dir)
-        remote_path = Path("/workspace/logs") / rel_path
-        sandbox.exec("mkdir", "-p", str(remote_path.parent)).wait()
-        with sandbox.open(str(remote_path), "wb") as handle:
-            handle.write(log_file.read_bytes())
+        remote_path = str(Path("/workspace/logs") / rel_path)
+        sandbox.mkdir(str(Path(remote_path).parent), parents=True)
+        sandbox.filesystem.write_bytes(log_file.read_bytes(), remote_path)
         if index % 10 == 0 or index == len(log_files):
             logger.info("Uploaded %d/%d files", index, len(log_files))
 
@@ -217,7 +202,7 @@ def clone_context_repos(sandbox: "modal.Sandbox", repo_urls: list[str]) -> None:
     if not repo_urls:
         return
 
-    sandbox.exec("mkdir", "-p", "/workspace/repos").wait()
+    sandbox.mkdir("/workspace/repos", parents=True)
 
     for repo_url in repo_urls:
         repo_name = repo_url.rsplit("/", 1)[-1].removesuffix(".git")
@@ -234,8 +219,7 @@ def clone_context_repos(sandbox: "modal.Sandbox", repo_urls: list[str]) -> None:
 
 def read_optional_file(sandbox: "modal.Sandbox", path: str) -> str | None:
     try:
-        with sandbox.open(path, "r") as handle:
-            return handle.read()
+        return sandbox.filesystem.read_text(path)
     except Exception:
         return None
 
@@ -260,13 +244,13 @@ def run_opencode_analysis(
     logger.info("Created Modal sandbox %s", sandbox.object_id)
 
     try:
-        sandbox.exec("mkdir", "-p", "/workspace/logs", "/workspace/repos").wait()
+        sandbox.mkdir("/workspace/logs", parents=True)
+        sandbox.mkdir("/workspace/repos", parents=True)
 
         clone_context_repos(sandbox, repo_urls)
         upload_tree(sandbox, log_dir)
 
-        with sandbox.open("/workspace/prompt.txt", "w") as handle:
-            handle.write(prompt)
+        sandbox.filesystem.write_text(prompt, "/workspace/prompt.txt")
 
         runner_script = f"""#!/bin/bash
 set -uo pipefail
@@ -285,8 +269,7 @@ else
 fi
 ls -la /workspace/logs > /workspace/logs/log_dir_listing.txt
 """
-        with sandbox.open("/workspace/run_opencode.sh", "w") as handle:
-            handle.write(runner_script)
+        sandbox.filesystem.write_text(runner_script, "/workspace/run_opencode.sh")
         sandbox.exec("chmod", "+x", "/workspace/run_opencode.sh").wait()
 
         logger.info("Running opencode analysis")

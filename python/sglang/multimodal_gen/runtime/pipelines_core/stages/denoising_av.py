@@ -82,6 +82,25 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
             batch.latents = latents
             batch.audio_latents = audio_latents
 
+        pipeline = self.pipeline() if self.pipeline else None
+        if (
+            pipeline is not None
+            and getattr(pipeline, "_use_premerged_stage2_transformer", False)
+            and server_args.dit_cpu_offload
+            and not server_args.use_fsdp_inference
+        ):
+            release_to_snapshots = getattr(
+                pipeline, "release_premerged_transformers_to_cpu_snapshots", None
+            )
+            if callable(release_to_snapshots):
+                release_to_snapshots()
+            else:
+                for dit in filter(None, [self.transformer, self.transformer_2]):
+                    if next(dit.parameters()).device.type == "cuda":
+                        dit.to("cpu")
+                if torch.get_device_module().is_available():
+                    torch.get_device_module().empty_cache()
+
         if isinstance(self.transformer, OffloadableDiTMixin):
             for manager in self.transformer.layerwise_offload_managers:
                 manager.release_all()
@@ -91,9 +110,17 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     """Stage-2 refinement wrapper that re-noises distilled LTX latents once."""
 
     def __init__(
-        self, transformer, scheduler, distilled_sigmas, vae=None, audio_vae=None
+        self,
+        transformer,
+        scheduler,
+        distilled_sigmas,
+        vae=None,
+        audio_vae=None,
+        pipeline=None,
     ):
-        super().__init__(transformer, scheduler, vae, audio_vae)
+        super().__init__(
+            transformer, scheduler, vae, audio_vae, pipeline=pipeline
+        )
         self.distilled_sigmas = torch.tensor(distilled_sigmas)
 
     @staticmethod

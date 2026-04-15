@@ -2,6 +2,7 @@ import copy
 import json
 import math
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from io import BytesIO
 
@@ -39,6 +40,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -75,6 +77,21 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         self._condition_image_encoder = None
         self._condition_image_encoder_dir = None
+
+    @staticmethod
+    def _ltx_perf_context(stage_name: str, batch: Req):
+        enabled = (
+            batch.perf_dump_path is not None
+            or os.environ.get("SGLANG_LTX_PROFILE_HOTSPOTS", "0") == "1"
+        )
+        if not enabled:
+            return nullcontext()
+        return StageProfiler(
+            stage_name,
+            logger=logger,
+            metrics=batch.metrics,
+            perf_dump_path_provided=True,
+        )
 
     @staticmethod
     def _get_video_latent_num_frames_for_model(
@@ -403,7 +420,13 @@ class LTX2DenoisingStage(DenoisingStage):
         *,
         is_ltx23_variant: bool,
     ) -> bool:
-        return False
+        return bool(
+            is_ltx23_variant
+            and get_sp_world_size() > 1
+            and server_args.pipeline_config.can_shard_audio_latents_for_sp(
+                batch.audio_latents
+            )
+        )
 
     def _get_condition_image_encoder(
         self,
@@ -581,104 +604,110 @@ class LTX2DenoisingStage(DenoisingStage):
         server_args: ServerArgs,
     ) -> LTX2DenoisingContext:
         """Extend the base context with LTX-2 audio, SP, and TI2V state."""
-        self._disable_cache_dit_for_request = batch.image_path is not None
-        base_ctx = super()._prepare_denoising_loop(batch, server_args)
-        ctx = LTX2DenoisingContext(**base_ctx.to_kwargs())
-        ctx.is_ltx23_variant = is_ltx23_native_variant(
-            server_args.pipeline_config.vae_config.arch_config
-        )
-        phase = batch.extra.get("ltx2_phase")
-        pipeline = self.pipeline() if self.pipeline else None
-        pipeline_name = pipeline.pipeline_name if pipeline is not None else None
-        ctx.use_ltx23_legacy_one_stage = self._should_use_ltx23_legacy_one_stage(
-            server_args, pipeline_name
-        )
-        ctx.stage = (
-            phase
-            if phase is not None
-            else ("stage1" if ctx.use_ltx23_legacy_one_stage else "one_stage")
-        )
-        ctx.audio_latents = batch.audio_latents
-        # Video and audio keep separate scheduler state throughout the denoising loop.
-        ctx.audio_scheduler = copy.deepcopy(self.scheduler)
-
-        # Prepare image latents and embeddings for LTX-2 TI2V generation.
-        self._prepare_ltx2_image_latent(batch, server_args)
-        do_ti2v = self._should_apply_ltx2_ti2v(batch)
-
-        if ctx.use_ltx23_legacy_one_stage:
-            batch.ltx23_audio_replicated_for_sp = False
-            batch.did_sp_shard_audio_latents = False
-        else:
-            ctx.replicate_audio_for_sp = self._should_replicate_ltx23_audio_for_sp(
-                batch,
-                server_args,
-                is_ltx23_variant=ctx.is_ltx23_variant,
+        with self._ltx_perf_context("LTX2PrepareDenoisingLoop", batch):
+            self._disable_cache_dit_for_request = batch.image_path is not None
+            base_ctx = super()._prepare_denoising_loop(batch, server_args)
+            ctx = LTX2DenoisingContext(**base_ctx.to_kwargs())
+            ctx.is_ltx23_variant = is_ltx23_native_variant(
+                server_args.pipeline_config.vae_config.arch_config
             )
-            batch.ltx23_audio_replicated_for_sp = bool(ctx.replicate_audio_for_sp)
-            if (
-                ctx.is_ltx23_variant
-                and get_sp_world_size() > 1
-                and server_args.pipeline_config.can_shard_audio_latents_for_sp(
-                    batch.audio_latents
-                )
-                and not ctx.replicate_audio_for_sp
-            ):
-                (
-                    batch.audio_latents,
-                    batch.did_sp_shard_audio_latents,
-                ) = server_args.pipeline_config.shard_audio_latents_for_sp(
-                    batch, batch.audio_latents
-                )
-                ctx.audio_latents = batch.audio_latents
-            else:
+            phase = batch.extra.get("ltx2_phase")
+            pipeline = self.pipeline() if self.pipeline else None
+            pipeline_name = pipeline.pipeline_name if pipeline is not None else None
+            ctx.use_ltx23_legacy_one_stage = self._should_use_ltx23_legacy_one_stage(
+                server_args, pipeline_name
+            )
+            ctx.stage = (
+                phase
+                if phase is not None
+                else ("stage1" if ctx.use_ltx23_legacy_one_stage else "one_stage")
+            )
+            ctx.audio_latents = batch.audio_latents
+            # Video and audio keep separate scheduler state throughout the denoising loop.
+            ctx.audio_scheduler = copy.deepcopy(self.scheduler)
+
+            # Prepare image latents and embeddings for LTX-2 TI2V generation.
+            self._prepare_ltx2_image_latent(batch, server_args)
+            do_ti2v = self._should_apply_ltx2_ti2v(batch)
+
+            if ctx.use_ltx23_legacy_one_stage:
+                batch.ltx23_audio_replicated_for_sp = False
                 batch.did_sp_shard_audio_latents = False
-
-        # For LTX-2 packed token latents, SP sharding happens on the time dimension
-        # (frames). The model must see local latent frames (RoPE offset is applied
-        # inside the model using SP rank).
-        ctx.latent_num_frames_for_model = self._get_video_latent_num_frames_for_model(
-            batch=batch, server_args=server_args, latents=ctx.latents
-        )
-        ctx.latent_height = (
-            batch.height
-            // server_args.pipeline_config.vae_config.arch_config.spatial_compression_ratio
-        )
-        ctx.latent_width = (
-            batch.width
-            // server_args.pipeline_config.vae_config.arch_config.spatial_compression_ratio
-        )
-        if do_ti2v:
-            if not (isinstance(ctx.latents, torch.Tensor) and ctx.latents.ndim == 3):
-                raise ValueError("LTX-2 TI2V expects packed token latents [B, S, D].")
-            clean_latent_background = getattr(
-                batch, "ltx2_ti2v_clean_latent_background", None
-            )
-            if not (
-                isinstance(clean_latent_background, torch.Tensor)
-                and clean_latent_background.shape == ctx.latents.shape
-            ):
-                clean_latent_background = None
-            # Keep conditioned tokens clean and reuse the mask during every step update.
-            ctx.latents, ctx.denoise_mask, ctx.clean_latent = (
-                self._prepare_ltx2_ti2v_clean_state(
-                    latents=ctx.latents,
-                    image_latent=batch.image_latent,
-                    num_img_tokens=int(getattr(batch, "ltx2_num_image_tokens", 0)),
-                    zero_clean_latent=ctx.is_ltx23_variant,
-                    clean_latent_background=clean_latent_background,
+            else:
+                ctx.replicate_audio_for_sp = self._should_replicate_ltx23_audio_for_sp(
+                    batch,
+                    server_args,
+                    is_ltx23_variant=ctx.is_ltx23_variant,
                 )
+                batch.ltx23_audio_replicated_for_sp = bool(ctx.replicate_audio_for_sp)
+                if (
+                    ctx.is_ltx23_variant
+                    and get_sp_world_size() > 1
+                    and server_args.pipeline_config.can_shard_audio_latents_for_sp(
+                        batch.audio_latents
+                    )
+                    and not ctx.replicate_audio_for_sp
+                ):
+                    (
+                        batch.audio_latents,
+                        batch.did_sp_shard_audio_latents,
+                    ) = server_args.pipeline_config.shard_audio_latents_for_sp(
+                        batch, batch.audio_latents
+                    )
+                    ctx.audio_latents = batch.audio_latents
+                else:
+                    batch.did_sp_shard_audio_latents = False
+
+            # For LTX-2 packed token latents, SP sharding happens on the time dimension
+            # (frames). The model must see local latent frames (RoPE offset is applied
+            # inside the model using SP rank).
+            ctx.latent_num_frames_for_model = self._get_video_latent_num_frames_for_model(
+                batch=batch, server_args=server_args, latents=ctx.latents
             )
-        return ctx
+            ctx.latent_height = (
+                batch.height
+                // server_args.pipeline_config.vae_config.arch_config.spatial_compression_ratio
+            )
+            ctx.latent_width = (
+                batch.width
+                // server_args.pipeline_config.vae_config.arch_config.spatial_compression_ratio
+            )
+            if do_ti2v:
+                if not (
+                    isinstance(ctx.latents, torch.Tensor) and ctx.latents.ndim == 3
+                ):
+                    raise ValueError(
+                        "LTX-2 TI2V expects packed token latents [B, S, D]."
+                    )
+                clean_latent_background = getattr(
+                    batch, "ltx2_ti2v_clean_latent_background", None
+                )
+                if not (
+                    isinstance(clean_latent_background, torch.Tensor)
+                    and clean_latent_background.shape == ctx.latents.shape
+                ):
+                    clean_latent_background = None
+                # Keep conditioned tokens clean and reuse the mask during every step update.
+                ctx.latents, ctx.denoise_mask, ctx.clean_latent = (
+                    self._prepare_ltx2_ti2v_clean_state(
+                        latents=ctx.latents,
+                        image_latent=batch.image_latent,
+                        num_img_tokens=int(getattr(batch, "ltx2_num_image_tokens", 0)),
+                        zero_clean_latent=ctx.is_ltx23_variant,
+                        clean_latent_background=clean_latent_background,
+                    )
+                )
+            return ctx
 
     def _before_denoising_loop(
         self, ctx: LTX2DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Reset the mirrored audio scheduler before the shared loop begins."""
-        super()._before_denoising_loop(ctx, batch, server_args)
-        if ctx.audio_scheduler is None:
-            raise ValueError("LTX-2 audio scheduler was not prepared.")
-        ctx.audio_scheduler.set_begin_index(0)
+        with self._ltx_perf_context("LTX2BeforeDenoisingLoop", batch):
+            super()._before_denoising_loop(ctx, batch, server_args)
+            if ctx.audio_scheduler is None:
+                raise ValueError("LTX-2 audio scheduler was not prepared.")
+            ctx.audio_scheduler.set_begin_index(0)
 
     def _prepare_step_attn_metadata(
         self,
@@ -937,43 +966,49 @@ class LTX2DenoisingStage(DenoisingStage):
                         v2a_cross_attention_mask, cfg_batch_size
                     )
 
-            with set_forward_context(
-                current_timestep=step.step_index, attn_metadata=step.attn_metadata
-            ):
-                model_video, model_audio = step.current_model(
-                    **build_model_kwargs(
-                        encoder_hidden_states=encoder_hidden_states,
-                        audio_encoder_hidden_states=audio_encoder_hidden_states,
-                        encoder_attention_mask=encoder_attention_mask,
-                    )
-                )
-
-            model_video = model_video.float()
-            model_audio = model_audio.float()
-            if batch.do_classifier_free_guidance:
-                model_video_uncond, model_video_text = model_video.chunk(2)
-                model_audio_uncond, model_audio_text = model_audio.chunk(2)
-                model_video = model_video_uncond + (
-                    batch.guidance_scale * (model_video_text - model_video_uncond)
-                )
-                model_audio = model_audio_uncond + (
-                    batch.guidance_scale * (model_audio_text - model_audio_uncond)
-                )
-
-            ctx.latents = self.scheduler.step(
-                model_video, step.t_device, ctx.latents, return_dict=False
-            )[0]
-            ctx.audio_latents = ctx.audio_scheduler.step(
-                model_audio, step.t_device, ctx.audio_latents, return_dict=False
-            )[0]
-            if ctx.denoise_mask is not None and ctx.clean_latent is not None:
-                ctx.latents = (
-                    ctx.latents.float() * ctx.denoise_mask
-                    + ctx.clean_latent.float() * (1.0 - ctx.denoise_mask)
-                ).to(dtype=ctx.latents.dtype)
-            ctx.latents = self.post_forward_for_ti2v_task(
-                batch, server_args, ctx.reserved_frames_mask, ctx.latents, ctx.z
+            first_step_forward_context = (
+                self._ltx_perf_context("LTX2FirstStepForward", batch)
+                if step.step_index == 0
+                else nullcontext()
             )
+            with first_step_forward_context:
+                with set_forward_context(
+                    current_timestep=step.step_index, attn_metadata=step.attn_metadata
+                ):
+                    model_video, model_audio = step.current_model(
+                        **build_model_kwargs(
+                            encoder_hidden_states=encoder_hidden_states,
+                            audio_encoder_hidden_states=audio_encoder_hidden_states,
+                            encoder_attention_mask=encoder_attention_mask,
+                        )
+                    )
+
+                model_video = model_video.float()
+                model_audio = model_audio.float()
+                if batch.do_classifier_free_guidance:
+                    model_video_uncond, model_video_text = model_video.chunk(2)
+                    model_audio_uncond, model_audio_text = model_audio.chunk(2)
+                    model_video = model_video_uncond + (
+                        batch.guidance_scale * (model_video_text - model_video_uncond)
+                    )
+                    model_audio = model_audio_uncond + (
+                        batch.guidance_scale * (model_audio_text - model_audio_uncond)
+                    )
+
+                ctx.latents = self.scheduler.step(
+                    model_video, step.t_device, ctx.latents, return_dict=False
+                )[0]
+                ctx.audio_latents = ctx.audio_scheduler.step(
+                    model_audio, step.t_device, ctx.audio_latents, return_dict=False
+                )[0]
+                if ctx.denoise_mask is not None and ctx.clean_latent is not None:
+                    ctx.latents = (
+                        ctx.latents.float() * ctx.denoise_mask
+                        + ctx.clean_latent.float() * (1.0 - ctx.denoise_mask)
+                    ).to(dtype=ctx.latents.dtype)
+                ctx.latents = self.post_forward_for_ti2v_task(
+                    batch, server_args, ctx.reserved_frames_mask, ctx.latents, ctx.z
+                )
             return
 
         encoder_hidden_states = batch.prompt_embeds[0]

@@ -1,5 +1,6 @@
 import math
 import os
+from collections.abc import Iterable
 
 import numpy as np
 import torch
@@ -9,9 +10,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
     sync_ltx23_runtime_vae_markers,
 )
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -30,6 +33,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -270,6 +274,19 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
     pipeline_name = "LTX2TwoStagePipeline"
     STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cpu_param_snapshots: dict[str, dict[str, torch.Tensor]] = {}
+        self._cpu_buffer_snapshots: dict[str, dict[str, torch.Tensor]] = {}
+        if self._use_premerged_stage2_transformer:
+            self._initialize_premerged_stage2_transformer(self.server_args)
+            self._capture_module_cpu_snapshot("transformer")
+            self._capture_module_cpu_snapshot("transformer_2")
+            self._pin_stage1_transformer_if_beneficial(self.server_args)
+            refinement_stage = self.get_stage("LTX2RefinementStage")
+            if refinement_stage is not None:
+                refinement_stage.transformer = self.get_module("transformer_2")
+
     @staticmethod
     def _should_merge_stage2_distilled_lora(server_args: ServerArgs) -> bool:
         return is_ltx23_native_variant(
@@ -307,9 +324,182 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         self._stage1_lora_path = server_args.lora_path
         self._stage1_lora_scale = float(server_args.lora_scale)
         self._active_lora_phase = None
+        self._use_premerged_stage2_transformer = (
+            self._should_merge_stage2_distilled_lora(server_args)
+            and self._stage1_lora_path is None
+        )
+
+    def _initialize_premerged_stage2_transformer(
+        self, server_args: ServerArgs
+    ) -> None:
+        transformer_path = self._resolve_component_path(
+            server_args, "transformer", "transformer"
+        )
+        module, memory_usage = PipelineComponentLoader.load_component(
+            component_name="transformer",
+            component_model_path=transformer_path,
+            transformers_or_diffusers="diffusers",
+            server_args=server_args,
+        )
+        self.modules["transformer_2"] = module
+        self.memory_usages["transformer_2"] = memory_usage
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if self.loaded_adapter_paths.get("ltx2_stage2_distilled") != self._distilled_lora_path:
+            self.load_lora_adapter(
+                self._distilled_lora_path,
+                "ltx2_stage2_distilled",
+                rank,
+            )
+
+        with self._temporarily_disable_offload(
+            target="transformer_2", use_module_names_only=True
+        ):
+            converted_count = self.convert_module_lora_layers(
+                self.modules["transformer_2"],
+                "transformer_2",
+                self.lora_layers_transformer_2,
+                check_exclude=True,
+            )
+            logger.info(
+                "Converted %d layers to LoRA layers in transformer_2",
+                converted_count,
+            )
+            self._apply_lora_to_layers(
+                self.lora_layers_transformer_2,
+                ["ltx2_stage2_distilled"],
+                [self._distilled_lora_path],
+                rank,
+                [1.0],
+                clear_existing=True,
+                merge_weights=True,
+            )
+
+        self.is_lora_merged["transformer_2"] = True
+        self.cur_adapter_name["transformer_2"] = "ltx2_stage2_distilled"
+        self.cur_adapter_path["transformer_2"] = self._distilled_lora_path
+        self.cur_adapter_strength["transformer_2"] = 1.0
+        self.cur_adapter_config["transformer_2"] = (
+            ["ltx2_stage2_distilled"],
+            [1.0],
+        )
+
+    def _iter_module_tensors(
+        self, module_name: str
+    ) -> tuple[Iterable[tuple[str, torch.nn.Parameter]], Iterable[tuple[str, torch.Tensor]]]:
+        module = self.get_module(module_name)
+        if module is None:
+            raise ValueError(f"Module {module_name} is not available.")
+        return module.named_parameters(), module.named_buffers()
+
+    @staticmethod
+    def _clone_cpu_tensor_snapshot(
+        tensor: torch.Tensor, *, pin_memory: bool
+    ) -> torch.Tensor:
+        snapshot = tensor.detach()
+        if snapshot.device.type == "cpu":
+            return snapshot
+
+        cpu_tensor = snapshot.to("cpu")
+        if pin_memory:
+            return cpu_tensor.pin_memory()
+        return cpu_tensor
+
+    def _capture_module_cpu_snapshot(self, module_name: str) -> None:
+        if module_name in self._cpu_param_snapshots:
+            return
+
+        pin_memory = bool(
+            self.server_args.pin_cpu_memory and torch.get_device_module().is_available()
+        )
+        params, buffers = self._iter_module_tensors(module_name)
+        self._cpu_param_snapshots[module_name] = {
+            name: self._clone_cpu_tensor_snapshot(param.data, pin_memory=pin_memory)
+            for name, param in params
+        }
+        self._cpu_buffer_snapshots[module_name] = {
+            name: self._clone_cpu_tensor_snapshot(buffer.data, pin_memory=pin_memory)
+            for name, buffer in buffers
+        }
+
+    def _release_module_to_cpu_snapshot(self, module_name: str) -> None:
+        module = self.get_module(module_name)
+        if module is None:
+            return
+
+        param_snapshots = self._cpu_param_snapshots.get(module_name)
+        buffer_snapshots = self._cpu_buffer_snapshots.get(module_name)
+        if param_snapshots is None or buffer_snapshots is None:
+            module.to("cpu")
+            return
+
+        for name, param in module.named_parameters():
+            snapshot = param_snapshots.get(name)
+            if snapshot is None:
+                raise KeyError(
+                    f"Missing CPU parameter snapshot for {module_name}.{name}"
+                )
+            param.data = snapshot
+
+        for name, buffer in module.named_buffers():
+            snapshot = buffer_snapshots.get(name)
+            if snapshot is None:
+                raise KeyError(
+                    f"Missing CPU buffer snapshot for {module_name}.{name}"
+                )
+            buffer.data = snapshot
+
+    def release_premerged_transformers_to_cpu_snapshots(self) -> None:
+        for module_name in ("transformer", "transformer_2"):
+            module = self.get_module(module_name)
+            if module is not None and next(module.parameters()).device.type == "cuda":
+                self._release_module_to_cpu_snapshot(module_name)
+        if torch.get_device_module().is_available():
+            torch.get_device_module().empty_cache()
+
+    @staticmethod
+    def _should_pin_stage1_transformer(server_args: ServerArgs) -> bool:
+        return (
+            server_args.dit_cpu_offload
+            and not server_args.use_fsdp_inference
+            and current_platform.is_cuda()
+            and current_platform.get_device_total_memory() / BYTES_PER_GB >= 70
+        )
+
+    def _pin_stage1_transformer_if_beneficial(self, server_args: ServerArgs) -> None:
+        if not self._should_pin_stage1_transformer(server_args):
+            return
+
+        transformer = self.get_module("transformer")
+        if next(transformer.parameters()).device.type == "cpu":
+            transformer.to(get_local_torch_device(), non_blocking=True)
+            logger.info(
+                "Pinned stage1 transformer on GPU for LTX-2.3 two-stage startup"
+            )
+        self._active_lora_phase = "stage1"
 
     def switch_lora_phase(self, phase: str) -> None:
         if phase == self._active_lora_phase:
+            return
+
+        if self._use_premerged_stage2_transformer:
+            if self.server_args.dit_cpu_offload:
+                if phase == "stage1":
+                    previous_name = "transformer_2"
+                    next_name = "transformer"
+                    previous_module = self.get_module("transformer_2")
+                    next_module = self.get_module("transformer")
+                else:
+                    previous_name = "transformer"
+                    next_name = "transformer_2"
+                    previous_module = self.get_module("transformer")
+                    next_module = self.get_module("transformer_2")
+
+                if next(previous_module.parameters()).device.type == "cuda":
+                    self._release_module_to_cpu_snapshot(previous_name)
+                if next(next_module.parameters()).device.type == "cpu":
+                    next_module.to(get_local_torch_device(), non_blocking=True)
+            self._active_lora_phase = phase
             return
 
         if phase == "stage1":
@@ -380,6 +570,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                     distilled_sigmas=self.STAGE_2_DISTILLED_SIGMA_VALUES,
                     vae=self.get_module("vae"),
                     audio_vae=self.get_module("audio_vae"),
+                    pipeline=self,
                 ),
             ]
         )

@@ -69,6 +69,7 @@ class LoRAPipeline(ComposedPipelineBase):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+
         # Initialize all mutable instance attributes to avoid sharing across instances
         self.lora_adapters = defaultdict(dict)
         self.loaded_adapter_paths = {}
@@ -192,18 +193,24 @@ class LoRAPipeline(ComposedPipelineBase):
             yield []
             return
 
-        # clear device cache to free up unused memory
-        if torch.get_device_module().is_available():
-            torch.get_device_module().synchronize()
-            torch.get_device_module().empty_cache()
-
         offload_disabled_modules = []
         for module_name in module_names:
             module = self.modules.get(module_name)
             if module is not None and isinstance(module, OffloadableDiTMixin):
-                if module.layerwise_offload_managers is not None:
-                    module.disable_offload()
+                if module.layerwise_offload_managers:
                     offload_disabled_modules.append(module)
+
+        if not offload_disabled_modules:
+            yield []
+            return
+
+        # Only synchronize when an actual layerwise-offload manager is active.
+        if torch.get_device_module().is_available():
+            torch.get_device_module().synchronize()
+            torch.get_device_module().empty_cache()
+
+        for module in offload_disabled_modules:
+            module.disable_offload()
 
         try:
             yield offload_disabled_modules

@@ -17,7 +17,6 @@ Example:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import shlex
 import shutil
@@ -241,52 +240,6 @@ def read_optional_file(sandbox: "modal.Sandbox", path: str) -> str | None:
         return None
 
 
-def extract_analysis_from_jsonl(jsonl_text: str) -> str:
-    text_parts: list[str] = []
-    errors: list[str] = []
-
-    for raw_line in jsonl_text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            logger.debug("Ignoring non-JSON opencode output line: %r", raw_line[:200])
-            continue
-
-        event_type = event.get("type")
-        if event_type == "text":
-            part = event.get("part") or {}
-            text = str(part.get("text") or "").strip()
-            if text:
-                text_parts.append(text)
-            continue
-
-        if event_type == "error":
-            error = event.get("error") or {}
-            if isinstance(error, dict):
-                message = None
-                data = error.get("data")
-                if isinstance(data, dict):
-                    message = data.get("message")
-                errors.append(
-                    str(message or error.get("name") or "unknown opencode error")
-                )
-
-    analysis = "\n\n".join(part for part in text_parts if part).strip()
-    if analysis:
-        return analysis
-
-    if errors:
-        raise RuntimeError(
-            "opencode failed without returning analysis: " + " | ".join(errors)
-        )
-
-    raise RuntimeError("opencode emitted JSON events but no assistant text")
-
-
 def run_opencode_analysis(
     *,
     log_dir: Path,
@@ -319,7 +272,6 @@ def run_opencode_analysis(
 set -uo pipefail
 cd /workspace
 if opencode run \\
-  --format json \\
   --dangerously-skip-permissions \\
   --dir /workspace/logs \\
   -m {shlex.quote(model)} \\
@@ -361,10 +313,10 @@ ls -la /workspace/logs > /workspace/logs/log_dir_listing.txt
             if ai_analysis and ai_analysis.strip():
                 return ai_analysis
 
-            analysis = extract_analysis_from_jsonl(opencode_stdout)
-            with sandbox.open("/workspace/logs/ai_analysis.md", "w") as handle:
-                handle.write(analysis)
-            return analysis
+            if opencode_stdout.strip():
+                return opencode_stdout
+
+            raise RuntimeError("opencode completed without producing analysis output")
         except Exception as exc:
             stdout = process.stdout.read()
             if stdout:

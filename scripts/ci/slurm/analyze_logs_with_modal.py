@@ -17,10 +17,13 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import shlex
 import shutil
 import tarfile
 import tempfile
+import warnings
 from pathlib import Path
 
 try:
@@ -41,6 +44,19 @@ PROMPT_PATH = Path(__file__).with_name("log_analysis_prompt.md")
 
 
 def configure_logging(verbose: bool) -> None:
+    warnings.filterwarnings(
+        "ignore",
+        category=PendingDeprecationWarning,
+        module=r"modal(\..*)?",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Sandbox\.open\(\) is deprecated.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*FileIO\.(write|read)\(\) is deprecated.*",
+    )
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s: %(message)s",
@@ -132,16 +148,6 @@ def build_sandbox_image() -> "modal.Image":
         .env(
             {
                 "PATH": "/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                "OPENCODE_CONFIG_CONTENT": """{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "openrouter": {
-      "options": {
-        "apiKey": "{env:OPENROUTER_API_KEY}"
-      }
-    }
-  }
-}""",
             }
         )
     )
@@ -168,7 +174,9 @@ def build_prompt(job_id: str, repo_urls: list[str]) -> str:
     for repo_url in repo_urls:
         repo_name = repo_url.rsplit("/", 1)[-1].removesuffix(".git")
         repo_lines.append(f"- **{repo_name} repo**: `/workspace/repos/{repo_name}/`")
-    repo_section = "\n".join(repo_lines) if repo_lines else "- No extra repos were requested."
+    repo_section = (
+        "\n".join(repo_lines) if repo_lines else "- No extra repos were requested."
+    )
 
     return f"""{skill_content}
 
@@ -225,6 +233,60 @@ def clone_context_repos(sandbox: "modal.Sandbox", repo_urls: list[str]) -> None:
         ).wait()
 
 
+def read_optional_file(sandbox: "modal.Sandbox", path: str) -> str | None:
+    try:
+        with sandbox.open(path, "r") as handle:
+            return handle.read()
+    except Exception:
+        return None
+
+
+def extract_analysis_from_jsonl(jsonl_text: str) -> str:
+    text_parts: list[str] = []
+    errors: list[str] = []
+
+    for raw_line in jsonl_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            logger.debug("Ignoring non-JSON opencode output line: %r", raw_line[:200])
+            continue
+
+        event_type = event.get("type")
+        if event_type == "text":
+            part = event.get("part") or {}
+            text = str(part.get("text") or "").strip()
+            if text:
+                text_parts.append(text)
+            continue
+
+        if event_type == "error":
+            error = event.get("error") or {}
+            if isinstance(error, dict):
+                message = None
+                data = error.get("data")
+                if isinstance(data, dict):
+                    message = data.get("message")
+                errors.append(
+                    str(message or error.get("name") or "unknown opencode error")
+                )
+
+    analysis = "\n\n".join(part for part in text_parts if part).strip()
+    if analysis:
+        return analysis
+
+    if errors:
+        raise RuntimeError(
+            "opencode failed without returning analysis: " + " | ".join(errors)
+        )
+
+    raise RuntimeError("opencode emitted JSON events but no assistant text")
+
+
 def run_opencode_analysis(
     *,
     log_dir: Path,
@@ -254,13 +316,22 @@ def run_opencode_analysis(
             handle.write(prompt)
 
         runner_script = f"""#!/bin/bash
-set -euo pipefail
+set -uo pipefail
 cd /workspace
-opencode run \\
+if opencode run \\
+  --format json \\
   --dangerously-skip-permissions \\
   --dir /workspace/logs \\
-  -m {model} \\
-  "$(cat /workspace/prompt.txt)" > /workspace/logs/ai_analysis.md
+  -m {shlex.quote(model)} \\
+  "$(cat /workspace/prompt.txt)" \\
+  < /dev/null \\
+  > /workspace/logs/opencode.stdout \\
+  2> /workspace/logs/opencode.stderr; then
+  echo 0 > /workspace/logs/opencode.exitcode
+else
+  echo $? > /workspace/logs/opencode.exitcode
+fi
+ls -la /workspace/logs > /workspace/logs/log_dir_listing.txt
 """
         with sandbox.open("/workspace/run_opencode.sh", "w") as handle:
             handle.write(runner_script)
@@ -270,22 +341,42 @@ opencode run \\
         process = sandbox.exec(
             "bash",
             "/workspace/run_opencode.sh",
-            pty=True,
         )
         process.wait()
 
         stderr = process.stderr.read()
         if stderr:
-            logger.warning("opencode stderr: %s", stderr[:500])
+            logger.warning("runner stderr: %s", stderr[:500])
 
+        exitcode = read_optional_file(sandbox, "/workspace/logs/opencode.exitcode")
+        opencode_stdout = (
+            read_optional_file(sandbox, "/workspace/logs/opencode.stdout") or ""
+        )
+        opencode_stderr = read_optional_file(sandbox, "/workspace/logs/opencode.stderr")
+        log_dir_listing = read_optional_file(
+            sandbox, "/workspace/logs/log_dir_listing.txt"
+        )
         try:
-            with sandbox.open("/workspace/logs/ai_analysis.md", "r") as handle:
-                return handle.read()
-        except Exception:
+            ai_analysis = read_optional_file(sandbox, "/workspace/logs/ai_analysis.md")
+            if ai_analysis and ai_analysis.strip():
+                return ai_analysis
+
+            analysis = extract_analysis_from_jsonl(opencode_stdout)
+            with sandbox.open("/workspace/logs/ai_analysis.md", "w") as handle:
+                handle.write(analysis)
+            return analysis
+        except Exception as exc:
             stdout = process.stdout.read()
             if stdout:
                 return stdout
-            raise RuntimeError("opencode analysis completed without producing output.")
+            details = [
+                f"opencode analysis did not produce a usable report: {exc}",
+                f"exitcode={exitcode!r}",
+                f"stdout_preview={opencode_stdout[:500]!r}",
+                f"stderr_preview={(opencode_stderr or '')[:500]!r}",
+                f"log_dir_listing={(log_dir_listing or '')[:500]!r}",
+            ]
+            raise RuntimeError(" ".join(details)) from exc
     finally:
         sandbox.terminate()
 

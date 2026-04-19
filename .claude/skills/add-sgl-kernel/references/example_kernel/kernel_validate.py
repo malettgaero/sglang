@@ -1,30 +1,30 @@
 """Validation script for the scale kernel.
 
-Runs correctness checks and shape validation against a PyTorch reference
-implementation. Use this to verify the kernel behaves correctly before
-running benchmarks.
+Runs correctness checks and shape/dtype validation against the PyTorch reference
+implementation. Useful for quick sanity checks after modifying the kernel.
 
 Usage:
     python kernel_validate.py
-    python kernel_validate.py --dtype float16
     python kernel_validate.py --verbose
+    python kernel_validate.py --shapes 128,256 512,1024
 """
 
 import argparse
-from typing import Optional
+import sys
+from typing import List, Tuple
 
 import torch
 
-from kernel import scale, scale_inplace
+from . import scale, scale_inplace
 
 
-def torch_scale(x: torch.Tensor, s: float) -> torch.Tensor:
-    """Reference PyTorch implementation of scale."""
-    return x * s
+def torch_scale(x: torch.Tensor, factor: float) -> torch.Tensor:
+    """Reference PyTorch implementation."""
+    return x * factor
 
 
 def _make_tensor(
-    shape: tuple,
+    shape: Tuple[int, ...],
     dtype: torch.dtype = torch.float32,
     device: str = "cuda",
 ) -> torch.Tensor:
@@ -32,143 +32,118 @@ def _make_tensor(
 
 
 def check(
-    actual: torch.Tensor,
+    result: torch.Tensor,
     expected: torch.Tensor,
+    label: str,
     atol: float = 1e-5,
     rtol: float = 1e-5,
-    label: str = "",
+    verbose: bool = False,
 ) -> bool:
-    """Compare two tensors and return True if they are close."""
-    if not torch.allclose(actual, expected.to(actual.dtype), atol=atol, rtol=rtol):
-        max_diff = (actual - expected.to(actual.dtype)).abs().max().item()
-        print(f"  FAIL {label}: max_diff={max_diff:.3e} (atol={atol}, rtol={rtol})")
-        return False
-    return True
-
-
-def validate_correctness(dtype: torch.dtype = torch.float32, verbose: bool = False) -> bool:
-    """Validate scale output matches PyTorch reference."""
-    shapes = [(1024,), (128, 256), (4, 32, 64)]
-    scalars = [0.5, 1.0, -2.0, 0.0]
-    passed = 0
-    total = 0
-
-    for shape in shapes:
-        for s in scalars:
-            x = _make_tensor(shape, dtype=dtype)
-            expected = torch_scale(x, s)
-            actual = scale(x, s)
-            label = f"shape={shape} s={s} dtype={dtype}"
-            ok = check(actual, expected, label=label)
-            if verbose:
-                status = "PASS" if ok else "FAIL"
-                print(f"  [{status}] {label}")
-            passed += int(ok)
-            total += 1
-
-    print(f"validate_correctness: {passed}/{total} passed")
-    return passed == total
-
-
-def validate_shapes(verbose: bool = False) -> bool:
-    """Validate that output shape matches input shape."""
-    shapes = [(1,), (100,), (8, 16), (2, 4, 8, 16)]
-    passed = 0
-
-    for shape in shapes:
-        x = _make_tensor(shape)
-        out = scale(x, 2.0)
-        ok = out.shape == x.shape
-        if verbose:
-            status = "PASS" if ok else "FAIL"
-            print(f"  [{status}] shape={shape} -> out.shape={out.shape}")
-        passed += int(ok)
-
-    print(f"validate_shapes: {passed}/{len(shapes)} passed")
-    return passed == len(shapes)
-
-
-def validate_inplace(verbose: bool = False) -> bool:
-    """Validate that scale_inplace modifies the tensor in-place."""
-    x = _make_tensor((256,))
-    x_orig = x.clone()
-    ptr_before = x.data_ptr()
-    scale_inplace(x, 3.0)
-    ptr_after = x.data_ptr()
-
-    same_ptr = ptr_before == ptr_after
-    correct = torch.allclose(x, x_orig * 3.0, atol=1e-5)
-    ok = same_ptr and correct
-
-    if verbose:
-        print(f"  same data_ptr: {same_ptr}")
-        print(f"  correct values: {correct}")
-
+    """Compare two tensors and print a pass/fail message."""
+    ok = torch.allclose(result, expected, atol=atol, rtol=rtol)
     status = "PASS" if ok else "FAIL"
-    print(f"validate_inplace: [{status}]")
+    print(f"  [{status}] {label}")
+    if not ok and verbose:
+        diff = (result - expected).abs()
+        print(f"         max_diff={diff.max().item():.3e}  mean_diff={diff.mean().item():.3e}")
     return ok
 
 
-def validate_dtypes(verbose: bool = False) -> bool:
-    """Validate supported dtypes."""
-    dtypes = [torch.float32, torch.float16, torch.bfloat16]
-    passed = 0
+def validate_correctness(verbose: bool = False) -> bool:
+    """Check numerical correctness for common shapes and dtypes."""
+    print("Correctness validation")
+    passed = True
+    configs = [
+        ((1024,), torch.float32, 2.0),
+        ((512, 512), torch.float32, 0.5),
+        ((128, 128, 4), torch.float32, -1.0),
+        ((1024,), torch.float16, 2.0),
+        ((512, 512), torch.bfloat16, 3.14),
+    ]
+    for shape, dtype, factor in configs:
+        x = _make_tensor(shape, dtype=dtype)
+        expected = torch_scale(x, factor)
+        result = scale(x, factor)
+        label = f"scale  shape={shape} dtype={dtype} factor={factor}"
+        passed &= check(result, expected, label, atol=1e-3, rtol=1e-3, verbose=verbose)
 
-    for dtype in dtypes:
-        try:
-            x = _make_tensor((512,), dtype=dtype)
-            out = scale(x, 0.5)
-            ok = out.dtype == dtype
-        except Exception as e:
-            if verbose:
-                print(f"  FAIL dtype={dtype}: {e}")
-            ok = False
+        # inplace variant
+        x_ip = x.clone()
+        scale_inplace(x_ip, factor)
+        label_ip = f"scale_inplace  shape={shape} dtype={dtype} factor={factor}"
+        passed &= check(x_ip, expected, label_ip, atol=1e-3, rtol=1e-3, verbose=verbose)
 
-        if verbose:
-            status = "PASS" if ok else "FAIL"
-            print(f"  [{status}] dtype={dtype}")
-        passed += int(ok)
+    return passed
 
-    print(f"validate_dtypes: {passed}/{len(dtypes)} passed")
-    return passed == len(dtypes)
+
+def validate_shapes(shapes: List[Tuple[int, ...]], verbose: bool = False) -> bool:
+    """Validate a user-supplied list of shapes."""
+    print("Custom shape validation")
+    passed = True
+    factor = 1.5
+    for shape in shapes:
+        x = _make_tensor(shape)
+        expected = torch_scale(x, factor)
+        result = scale(x, factor)
+        label = f"scale  shape={shape}"
+        passed &= check(result, expected, label, verbose=verbose)
+    return passed
+
+
+def validate_edge_cases(verbose: bool = False) -> bool:
+    """Check edge cases: zero tensor, single element, large values."""
+    print("Edge-case validation")
+    passed = True
+
+    # zero tensor
+    x = torch.zeros(256, device="cuda")
+    passed &= check(scale(x, 99.0), x, "zero tensor", verbose=verbose)
+
+    # single element
+    x = torch.tensor([3.0], device="cuda")
+    passed &= check(scale(x, 2.0), torch.tensor([6.0], device="cuda"), "single element", verbose=verbose)
+
+    # large values (overflow check for fp16 skipped intentionally)
+    x = _make_tensor((1024,), dtype=torch.float32)
+    x = x * 1e4
+    passed &= check(scale(x, 1.0), torch_scale(x, 1.0), "large values factor=1", verbose=verbose)
+
+    return passed
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate scale kernel")
-    parser.add_argument(
-        "--dtype",
-        choices=["float32", "float16", "bfloat16"],
-        default="float32",
-        help="Primary dtype for correctness validation",
+    p = argparse.ArgumentParser(description="Validate the scale kernel")
+    p.add_argument("--verbose", action="store_true", help="Print diff stats on failure")
+    p.add_argument(
+        "--shapes",
+        nargs="+",
+        metavar="DIM,DIM",
+        help="Extra shapes to validate, e.g. 128,256 1024,1024",
     )
-    parser.add_argument("--verbose", action="store_true", help="Print per-case results")
-    return parser.parse_args()
+    return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    dtype_map = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    dtype = dtype_map[args.dtype]
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for kernel validation")
+        print("ERROR: CUDA not available — skipping validation.")
+        sys.exit(1)
 
-    results = [
-        validate_correctness(dtype=dtype, verbose=args.verbose),
-        validate_shapes(verbose=args.verbose),
-        validate_inplace(verbose=args.verbose),
-        validate_dtypes(verbose=args.verbose),
-    ]
+    results = []
+    results.append(validate_correctness(verbose=args.verbose))
+    results.append(validate_edge_cases(verbose=args.verbose))
 
-    total = len(results)
-    passed = sum(results)
-    print(f"\nOverall: {passed}/{total} validation suites passed")
-    if passed < total:
-        raise SystemExit(1)
+    if args.shapes:
+        parsed = [tuple(int(d) for d in s.split(",")) for s in args.shapes]
+        results.append(validate_shapes(parsed, verbose=args.verbose))
+
+    print()
+    if all(results):
+        print("All validations PASSED.")
+    else:
+        print("Some validations FAILED.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

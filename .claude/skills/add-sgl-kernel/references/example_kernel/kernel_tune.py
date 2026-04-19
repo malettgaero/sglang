@@ -1,116 +1,122 @@
-"""Auto-tuning script for the scale kernel.
+"""Autotuning script for the scale kernel.
 
-Runs a grid search over block sizes and other launch parameters,
-reports the best configuration for each (dtype, size) combination.
+Runs a grid search over kernel configurations and reports the best
+performing config for each (M,) shape.
 
-Usage:
-    python kernel_tune.py
-    python kernel_tune.py --dtype float16 --sizes 1048576 4194304
+Usage::
+
+    python kernel_tune.py --shapes 1024 4096 16384 --iters 200
 """
 
 import argparse
 import itertools
+import time
 from typing import List, Tuple
 
 import torch
 
 try:
-    from . import scale as _scale_op
-except ImportError:
-    from kernel import scale as _scale_op
+    import example_kernel as ek
+except ImportError as e:
+    raise ImportError("Build the kernel first: pip install -e .") from e
 
+# ---------------------------------------------------------------------------
+# Configs to sweep
+# ---------------------------------------------------------------------------
 
-DTYPE_MAP = {
-    "float32": torch.float32,
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-}
-
-# Tuning grid
 BLOCK_SIZES = [128, 256, 512, 1024]
-ELEMS_PER_THREAD = [1, 2, 4, 8]
-NUM_WARMUP = 5
-NUM_ITERS = 50
+NUM_WARPS_OPTIONS = [2, 4, 8]
 
 
-def _make_tensor(numel: int, dtype: torch.dtype) -> torch.Tensor:
-    return torch.randn(numel, dtype=dtype, device="cuda")
+def _make_tensor(n: int, dtype=torch.float32) -> torch.Tensor:
+    return torch.randn(n, dtype=dtype, device="cuda")
 
 
 def benchmark_config(
-    x: torch.Tensor,
-    scalar: float,
+    n: int,
     block_size: int,
-    elems_per_thread: int,
+    num_warps: int,
+    iters: int = 200,
+    dtype=torch.float32,
 ) -> float:
-    """Return median latency in microseconds for a given config."""
+    """Return median latency in microseconds for the given config."""
+    x = _make_tensor(n, dtype=dtype)
+    scalar = 2.0
     out = torch.empty_like(x)
 
-    # Warmup
-    for _ in range(NUM_WARMUP):
-        _scale_op(x, scalar, out=out, block_size=block_size, elems_per_thread=elems_per_thread)
+    # Warm-up
+    for _ in range(20):
+        ek.scale(x, scalar, out)
     torch.cuda.synchronize()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    start.record()
-    for _ in range(NUM_ITERS):
-        _scale_op(x, scalar, out=out, block_size=block_size, elems_per_thread=elems_per_thread)
-    end.record()
+    # Timed runs
+    start = time.perf_counter()
+    for _ in range(iters):
+        ek.scale(x, scalar, out)
     torch.cuda.synchronize()
-
-    return start.elapsed_time(end) * 1e3 / NUM_ITERS  # µs
+    elapsed_us = (time.perf_counter() - start) / iters * 1e6
+    return elapsed_us
 
 
 def tune(
-    sizes: List[int],
-    dtypes: List[torch.dtype],
-) -> dict:
-    """Grid-search over configs; return best per (dtype, size)."""
-    results = {}
+    shapes: List[int],
+    iters: int = 200,
+    dtype=torch.float32,
+) -> List[Tuple]:
+    """Grid-search over configs for each shape; return list of best results."""
+    results = []
+    configs = list(itertools.product(BLOCK_SIZES, NUM_WARPS_OPTIONS))
 
-    for dtype, numel in itertools.product(dtypes, sizes):
-        x = _make_tensor(numel, dtype)
-        best_time = float("inf")
-        best_cfg: Tuple[int, int] = (BLOCK_SIZES[0], ELEMS_PER_THREAD[0])
-
-        for bs, ept in itertools.product(BLOCK_SIZES, ELEMS_PER_THREAD):
+    for n in shapes:
+        best_us = float("inf")
+        best_cfg = None
+        for block_size, num_warps in configs:
             try:
-                t = benchmark_config(x, 2.0, bs, ept)
-            except Exception:
-                # Some configs may be invalid for small tensors
+                us = benchmark_config(n, block_size, num_warps, iters=iters, dtype=dtype)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  [skip] n={n} block={block_size} warps={num_warps}: {exc}")
                 continue
-            if t < best_time:
-                best_time = t
-                best_cfg = (bs, ept)
-
-        key = (str(dtype).split(".")[1], numel)
-        results[key] = {"block_size": best_cfg[0], "elems_per_thread": best_cfg[1], "us": round(best_time, 3)}
-        print(f"  dtype={key[0]:>10s}  numel={numel:>10,}  best_block={best_cfg[0]:>5}  ept={best_cfg[1]}  latency={best_time:.3f} µs")
-
+            if us < best_us:
+                best_us = us
+                best_cfg = (block_size, num_warps)
+        results.append((n, best_cfg, best_us))
+        print(
+            f"n={n:>8}  best_block={best_cfg[0]:>4}  best_warps={best_cfg[1]}  "
+            f"latency={best_us:.2f} us"
+        )
     return results
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Tune scale kernel launch parameters")
-    p.add_argument("--dtype", nargs="+", default=list(DTYPE_MAP.keys()), choices=list(DTYPE_MAP.keys()))
-    p.add_argument("--sizes", nargs="+", type=int, default=[65536, 262144, 1048576, 4194304])
+    p = argparse.ArgumentParser(description="Autotune example_kernel.scale")
+    p.add_argument(
+        "--shapes",
+        nargs="+",
+        type=int,
+        default=[1024, 4096, 16384, 65536, 262144],
+        help="Vector lengths to tune over",
+    )
+    p.add_argument("--iters", type=int, default=200, help="Timed iterations per config")
+    p.add_argument(
+        "--dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="float32",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    dtypes = [DTYPE_MAP[d] for d in args.dtype]
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    dtype = dtype_map[args.dtype]
 
-    print(f"Tuning on {torch.cuda.get_device_name(0)}")
-    print(f"dtypes={args.dtype}  sizes={args.sizes}\n")
-
-    results = tune(args.sizes, dtypes)
-
-    print("\n=== Summary ===")
-    for (dtype, numel), cfg in results.items():
-        print(f"  {dtype:>10s}  {numel:>10,}  -> block_size={cfg['block_size']}, elems_per_thread={cfg['elems_per_thread']}  ({cfg['us']} µs)")
+    print(f"Tuning scale kernel  dtype={args.dtype}  iters={args.iters}")
+    print("-" * 60)
+    tune(args.shapes, iters=args.iters, dtype=dtype)
 
 
 if __name__ == "__main__":
